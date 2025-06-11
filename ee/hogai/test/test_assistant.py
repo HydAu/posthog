@@ -180,7 +180,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
             self.assertDictContainsSubset(expected_msg_dict, msg_dict, f"Message content mismatch at index {i}")
 
     @patch(
-        "ee.hogai.graph.trends.nodes.TrendsPlannerNode.run",
+        "ee.hogai.graph.trends.nodes.QueryPlannerNode.run",
         return_value=PartialAssistantState(
             intermediate_steps=[
                 (AgentAction(tool="final_answer", tool_input="Plan", log=""), None),
@@ -213,7 +213,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
                 "message",
                 {
                     "type": "ai/reasoning",
-                    "content": "Picking relevant events and properties",  # For TrendsPlannerNode
+                    "content": "Picking relevant events and properties",  # For QueryPlannerNode
                     "substeps": [],
                 },
             ),
@@ -221,7 +221,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
                 "message",
                 {
                     "type": "ai/reasoning",
-                    "content": "Picking relevant events and properties",  # For TrendsPlannerToolsNode
+                    "content": "Picking relevant events and properties",  # For QueryPlannerToolsNode
                     "substeps": [],
                 },
             ),
@@ -229,7 +229,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
         self.assertConversationEqual(output, expected_output)
 
     @patch(
-        "ee.hogai.graph.trends.nodes.TrendsPlannerNode.run",
+        "ee.hogai.graph.trends.nodes.QueryPlannerNode.run",
         return_value=PartialAssistantState(
             intermediate_steps=[
                 # Compare with toolkit.py to see supported AgentAction shapes. The list below is supposed to include ALL
@@ -275,7 +275,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
                 "message",
                 {
                     "type": "ai/reasoning",
-                    "content": "Picking relevant events and properties",  # For TrendsPlannerNode
+                    "content": "Picking relevant events and properties",  # For QueryPlannerNode
                     "substeps": [],
                 },
             ),
@@ -283,7 +283,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
                 "message",
                 {
                     "type": "ai/reasoning",
-                    "content": "Picking relevant events and properties",  # For TrendsPlannerToolsNode
+                    "content": "Picking relevant events and properties",  # For QueryPlannerToolsNode
                     "substeps": [
                         "Exploring session properties",
                         "Exploring `$pageview` event's properties",
@@ -299,7 +299,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
         action = Action.objects.create(team=self.team, name="Marius Tech Tips")
 
         with patch(
-            "ee.hogai.graph.trends.nodes.TrendsPlannerNode.run",
+            "ee.hogai.graph.trends.nodes.QueryPlannerNode.run",
             return_value=PartialAssistantState(
                 intermediate_steps=[
                     (
@@ -341,7 +341,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
                     "message",
                     {
                         "type": "ai/reasoning",
-                        "content": "Picking relevant events and properties",  # For TrendsPlannerNode
+                        "content": "Picking relevant events and properties",  # For QueryPlannerNode
                         "substeps": [],
                     },
                 ),
@@ -349,7 +349,7 @@ class TestAssistant(ClickhouseTestMixin, NonAtomicBaseTest):
                     "message",
                     {
                         "type": "ai/reasoning",
-                        "content": "Picking relevant events and properties",  # For TrendsPlannerToolsNode
+                        "content": "Picking relevant events and properties",  # For QueryPlannerToolsNode
                         "substeps": [
                             "Exploring `Marius Tech Tips` action properties",
                             "Analyzing `video_name` action property of `Marius Tech Tips`",
