@@ -1,7 +1,7 @@
 use crate::api::errors::FlagError;
 use crate::cohorts::cohort_models::CohortId;
 use crate::flags::flag_models::*;
-use crate::properties::property_models::PropertyFilter;
+use crate::properties::property_models::{PropertyFilter, PropertyType};
 use common_database::Client as DatabaseClient;
 use common_redis::Client as RedisClient;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tracing::instrument;
 impl PropertyFilter {
     /// Checks if the filter is a cohort filter
     pub fn is_cohort(&self) -> bool {
-        self.key == "id" && self.prop_type == "cohort"
+        self.key == "id" && self.prop_type == PropertyType::Cohort
     }
 
     /// Returns the cohort id if the filter is a cohort filter, or None if it's not a cohort filter
@@ -23,6 +23,20 @@ impl PropertyFilter {
             .as_ref()
             .and_then(|value| value.as_i64())
             .map(|id| id as CohortId)
+    }
+
+    /// Checks if the filter is a feature flag filter
+    pub fn is_feature_flag(&self) -> bool {
+        self.prop_type == PropertyType::Flag
+    }
+
+    /// Returns the feature flag id if the filter is a feature flag filter, or None if it's not a feature flag filter
+    /// or if the value cannot be parsed as a feature flag id
+    pub fn get_feature_flag_id(&self) -> Option<FeatureFlagId> {
+        if !self.is_feature_flag() {
+            return None;
+        }
+        self.key.parse::<FeatureFlagId>().ok()
     }
 }
 
@@ -70,7 +84,11 @@ impl FeatureFlagList {
 
         let flags_list: Vec<FeatureFlag> =
             serde_json::from_str(&serialized_flags).map_err(|e| {
-                tracing::error!("failed to parse data to flags list: {}", e);
+                tracing::error!(
+                    "failed to parse data to flags list for project {}: {}",
+                    project_id,
+                    e
+                );
                 FlagError::RedisDataParsingError
             })?;
 
@@ -91,7 +109,11 @@ impl FeatureFlagList {
         project_id: i64,
     ) -> Result<FeatureFlagList, FlagError> {
         let mut conn = client.get_connection().await.map_err(|e| {
-            tracing::error!("Failed to get database connection: {}", e);
+            tracing::error!(
+                "Failed to get database connection for project {}: {}",
+                project_id,
+                e
+            );
             FlagError::DatabaseUnavailable
         })?;
 
@@ -116,7 +138,11 @@ impl FeatureFlagList {
             .fetch_all(&mut *conn)
             .await
             .map_err(|e| {
-                tracing::error!("Failed to fetch feature flags from database: {}", e);
+                tracing::error!(
+                    "Failed to fetch feature flags from database for project {}: {}",
+                    project_id,
+                    e
+                );
                 FlagError::Internal(format!("Database query error: {}", e))
             })?;
 
@@ -124,7 +150,13 @@ impl FeatureFlagList {
             .into_iter()
             .map(|row| {
                 let filters = serde_json::from_value(row.filters).map_err(|e| {
-                    tracing::error!("Failed to deserialize filters for flag {}: {}", row.key, e);
+                    tracing::error!(
+                        "Failed to deserialize filters for flag {} in project {} (team {}): {}",
+                        row.key,
+                        project_id,
+                        row.team_id,
+                        e
+                    );
                     FlagError::DeserializeFiltersError
                 })?;
 
@@ -151,7 +183,12 @@ impl FeatureFlagList {
         flags: &FeatureFlagList,
     ) -> Result<(), FlagError> {
         let payload = serde_json::to_string(&flags.flags).map_err(|e| {
-            tracing::error!("Failed to serialize flags: {}", e);
+            tracing::error!(
+                "Failed to serialize {} flags for project {}: {}",
+                flags.flags.len(),
+                project_id,
+                e
+            );
             FlagError::RedisDataParsingError
         })?;
 
@@ -166,7 +203,11 @@ impl FeatureFlagList {
             .set(format!("{TEAM_FLAGS_CACHE_PREFIX}{}", project_id), payload)
             .await
             .map_err(|e| {
-                tracing::error!("Failed to update Redis cache: {}", e);
+                tracing::error!(
+                    "Failed to update Redis cache for project {}: {}",
+                    project_id,
+                    e
+                );
                 FlagError::CacheUpdateError
             })?;
 
@@ -176,7 +217,10 @@ impl FeatureFlagList {
 
 #[cfg(test)]
 mod tests {
-    use crate::{flags::flag_models::*, properties::property_models::OperatorType};
+    use crate::{
+        flags::flag_models::*,
+        properties::property_models::{OperatorType, PropertyType},
+    };
     use rand::Rng;
     use serde_json::json;
     use std::time::Instant;
@@ -281,7 +325,7 @@ mod tests {
         assert_eq!(property_filter.key, "email");
         assert_eq!(property_filter.value, Some(json!("a@b.com")));
         assert_eq!(property_filter.operator, None);
-        assert_eq!(property_filter.prop_type, "person");
+        assert_eq!(property_filter.prop_type, PropertyType::Person);
         assert_eq!(property_filter.group_type_index, None);
         assert_eq!(flag.filters.groups[0].rollout_percentage, Some(50.0));
     }
@@ -866,9 +910,9 @@ mod tests {
                                 "operator": "exact"
                             },
                             {
-                                "key": "purchase",
-                                "value": "completed",
-                                "type": "event",
+                                "key": "cohort",
+                                "value": "123",
+                                "type": "cohort",
                                 "operator": "exact"
                             }
                         ],
@@ -919,9 +963,9 @@ mod tests {
         assert_eq!(redis_flag.key, "flag_with_different_properties");
         let redis_properties = &redis_flag.filters.groups[0].properties.as_ref().unwrap();
         assert_eq!(redis_properties.len(), 3);
-        assert_eq!(redis_properties[0].prop_type, "person");
-        assert_eq!(redis_properties[1].prop_type, "group");
-        assert_eq!(redis_properties[2].prop_type, "event");
+        assert_eq!(redis_properties[0].prop_type, PropertyType::Person);
+        assert_eq!(redis_properties[1].prop_type, PropertyType::Group);
+        assert_eq!(redis_properties[2].prop_type, PropertyType::Cohort);
 
         // Fetch and verify from Postgres
         let pg_flags = FeatureFlagList::from_pg(reader, team.project_id)
@@ -933,9 +977,9 @@ mod tests {
         assert_eq!(pg_flag.key, "flag_with_different_properties");
         let pg_properties = &pg_flag.filters.groups[0].properties.as_ref().unwrap();
         assert_eq!(pg_properties.len(), 3);
-        assert_eq!(pg_properties[0].prop_type, "person");
-        assert_eq!(pg_properties[1].prop_type, "group");
-        assert_eq!(pg_properties[2].prop_type, "event");
+        assert_eq!(pg_properties[0].prop_type, PropertyType::Person);
+        assert_eq!(pg_properties[1].prop_type, PropertyType::Group);
+        assert_eq!(pg_properties[2].prop_type, PropertyType::Cohort);
     }
 
     #[tokio::test]
@@ -1208,8 +1252,8 @@ mod tests {
             .expect("Failed to fetch flags from Postgres");
         let pg_duration = start.elapsed();
 
-        println!("Redis fetch time: {:?}", redis_duration);
-        println!("Postgres fetch time: {:?}", pg_duration);
+        tracing::info!("Redis fetch time: {:?}", redis_duration);
+        tracing::info!("Postgres fetch time: {:?}", pg_duration);
 
         assert_eq!(redis_flags.flags.len(), num_flags);
         assert_eq!(pg_flags.flags.len(), num_flags);

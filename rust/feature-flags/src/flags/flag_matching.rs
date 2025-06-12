@@ -1,11 +1,14 @@
 use crate::api::errors::FlagError;
-use crate::api::types::{ConfigResponse, FlagDetails, FlagsResponse, FromFeatureAndMatch};
+use crate::api::types::{
+    ConfigResponse, FlagDetails, FlagValue, FlagsResponse, FromFeatureAndMatch,
+};
 use crate::cohorts::cohort_cache_manager::CohortCacheManager;
 use crate::cohorts::cohort_models::{Cohort, CohortId};
 use crate::cohorts::cohort_operations::{apply_cohort_membership_logic, evaluate_dynamic_cohorts};
 use crate::flags::flag_group_type_mapping::{GroupTypeIndex, GroupTypeMappingCache};
 use crate::flags::flag_match_reason::FeatureFlagMatchReason;
-use crate::flags::flag_models::{FeatureFlag, FeatureFlagList, FlagPropertyGroup};
+use crate::flags::flag_matching_utils::all_flag_condition_properties_match;
+use crate::flags::flag_models::{FeatureFlag, FeatureFlagId, FeatureFlagList, FlagPropertyGroup};
 use crate::metrics::consts::{
     DB_PERSON_AND_GROUP_PROPERTIES_READS_COUNTER, FLAG_DB_PROPERTIES_FETCH_TIME,
     FLAG_EVALUATE_ALL_CONDITIONS_TIME, FLAG_EVALUATION_ERROR_COUNTER, FLAG_EVALUATION_TIME,
@@ -25,11 +28,11 @@ use serde_json::Value;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 #[cfg(test)] // Only used in the tests
-use crate::api::types::{FlagValue, LegacyFlagsResponse};
+use crate::api::types::LegacyFlagsResponse;
 
 use super::flag_matching_utils::{
     all_properties_match, calculate_hash, fetch_and_locally_cache_all_relevant_properties,
@@ -56,6 +59,16 @@ pub struct FeatureFlagMatch {
     pub payload: Option<Value>,
 }
 
+impl FeatureFlagMatch {
+    pub fn get_flag_value(&self) -> FlagValue {
+        match (self.matches, &self.variant) {
+            (true, Some(variant)) => FlagValue::String(variant.clone()),
+            (true, None) => FlagValue::Boolean(true),
+            (false, _) => FlagValue::Boolean(false),
+        }
+    }
+}
+
 /// This struct maintains evaluation state by caching database-sourced data during feature flag evaluation.
 /// It stores person IDs, properties, group properties, and cohort matches that are fetched from the database,
 /// allowing them to be reused across multiple flag evaluations within the same request without additional DB lookups.
@@ -73,6 +86,8 @@ pub struct FlagEvaluationState {
     cohorts: Option<Vec<Cohort>>,
     /// Cache of static cohort membership results to avoid repeated DB lookups
     static_cohort_matches: Option<HashMap<CohortId, bool>>,
+    /// Cache of flag evaluation results to avoid repeated DB lookups
+    flag_evaluation_results: HashMap<FeatureFlagId, FlagValue>,
 }
 
 impl FlagEvaluationState {
@@ -114,6 +129,10 @@ impl FlagEvaluationState {
 
     pub fn set_static_cohort_matches(&mut self, matches: HashMap<CohortId, bool>) {
         self.static_cohort_matches = Some(matches);
+    }
+
+    pub fn add_flag_evaluation_result(&mut self, flag_id: FeatureFlagId, flag_value: FlagValue) {
+        self.flag_evaluation_results.insert(flag_id, flag_value);
     }
 }
 
@@ -312,8 +331,8 @@ impl FeatureFlagMatcher {
             Ok(should_write) => should_write,
             Err(e) => {
                 error!(
-                    "Failed to check if hash key override should be written: {:?}",
-                    e
+                    "Failed to check if hash key override should be written for team {} project {} distinct_id {}: {:?}",
+                    self.team_id, self.project_id, self.distinct_id, e
                 );
                 let reason = parse_exception_for_prometheus_label(&e);
                 inc(
@@ -338,7 +357,7 @@ impl FeatureFlagMatcher {
             )
             .await
             {
-                error!("Failed to set feature flag hash key overrides: {:?}", e);
+                error!("Failed to set feature flag hash key overrides for team {} project {} distinct_id {} hash_key {}: {:?}", self.team_id, self.project_id, self.distinct_id, hash_key, e);
                 let reason = parse_exception_for_prometheus_label(&e);
                 inc(
                     FLAG_EVALUATION_ERROR_COUNTER,
@@ -368,7 +387,7 @@ impl FeatureFlagMatcher {
         {
             Ok(overrides) => (Some(overrides), false),
             Err(e) => {
-                error!("Failed to get feature flag hash key overrides: {:?}", e);
+                error!("Failed to get feature flag hash key overrides for team {} project {} distinct_id {}: {:?}", self.team_id, self.project_id, self.distinct_id, e);
                 let reason = parse_exception_for_prometheus_label(&e);
                 common_metrics::inc(
                     FLAG_EVALUATION_ERROR_COUNTER,
@@ -483,6 +502,8 @@ impl FeatureFlagMatcher {
                 hash_key_overrides.clone(),
             ) {
                 Ok(Some(flag_match)) => {
+                    self.flag_evaluation_state
+                        .add_flag_evaluation_result(flag.id, flag_match.get_flag_value());
                     flag_details_map
                         .insert(flag.key.clone(), FlagDetails::create(flag, &flag_match));
                 }
@@ -491,11 +512,22 @@ impl FeatureFlagMatcher {
                 }
                 Err(e) => {
                     errors_while_computing_flags = true;
-                    error!(
-                        "Error evaluating feature flag '{}' with overrides for distinct_id '{}': {:?}",
-                        flag.key, self.distinct_id, e
-                    );
                     let reason = parse_exception_for_prometheus_label(&e);
+
+                    // Only log errors that aren't CohortNotFound, since CohortNotFound errors bubble up here in the event
+                    // that the flag is targeting a deleted cohort
+                    if !matches!(e, FlagError::CohortNotFound(_)) {
+                        error!(
+                            "Error evaluating feature flag '{}' with overrides for distinct_id '{}': {:?}",
+                            flag.key, self.distinct_id, e
+                        );
+                    } else {
+                        warn!(
+                            "Feature flag '{}' targeting deleted cohort for distinct_id '{}': {:?}",
+                            flag.key, self.distinct_id, e
+                        );
+                    }
+
                     inc(
                         FLAG_EVALUATION_ERROR_COUNTER,
                         &[("reason".to_string(), reason.to_string())],
@@ -521,13 +553,14 @@ impl FeatureFlagMatcher {
                 .prepare_flag_evaluation_state(&flags_needing_db_properties)
                 .await
             {
+                // Handle database errors and return early
                 errors_while_computing_flags = true;
                 let reason = parse_exception_for_prometheus_label(&e);
                 for flag in flags_needing_db_properties {
                     flag_details_map
                         .insert(flag.key.clone(), FlagDetails::create_error(&flag, reason));
                 }
-                error!("Error preparing flag evaluation state: {:?}", e);
+                error!("Error preparing flag evaluation state for team {} project {} distinct_id {}: {:?}", self.team_id, self.project_id, self.distinct_id, e);
                 inc(
                     FLAG_EVALUATION_ERROR_COUNTER,
                     &[("reason".to_string(), reason.to_string())],
@@ -541,62 +574,74 @@ impl FeatureFlagMatcher {
                     config: ConfigResponse::default(),
                 };
             }
+        }
 
-            // Step 3: Evaluate remaining flags with cached properties
-            let flag_get_match_timer = common_metrics::timing_guard(FLAG_GET_MATCH_TIME, &[]);
+        // Step 3: Evaluate remaining flags with cached properties
+        let flag_get_match_timer = common_metrics::timing_guard(FLAG_GET_MATCH_TIME, &[]);
 
-            // Create a HashMap for quick flag lookups
-            let flags_map: HashMap<_, _> = flags_needing_db_properties
-                .iter()
-                .map(|flag| (flag.key.clone(), flag))
+        // Create a HashMap for quick flag lookups
+        let flags_map: HashMap<_, _> = flags_needing_db_properties
+            .iter()
+            .map(|flag| (flag.key.clone(), flag))
+            .collect();
+
+        let results: Vec<(String, Result<FeatureFlagMatch, FlagError>)> =
+            flags_needing_db_properties
+                .par_iter()
+                .map(|flag| {
+                    (
+                        flag.key.clone(),
+                        self.get_match(flag, None, hash_key_overrides.clone()),
+                    )
+                })
                 .collect();
 
-            let results: Vec<(String, Result<FeatureFlagMatch, FlagError>)> =
-                flags_needing_db_properties
-                    .par_iter()
-                    .map(|flag| {
-                        (
-                            flag.key.clone(),
-                            self.get_match(flag, None, hash_key_overrides.clone()),
-                        )
-                    })
-                    .collect();
+        for (flag_key, result) in results {
+            let flag = flags_map.get(&flag_key).unwrap();
 
-            for (flag_key, result) in results {
-                let flag = flags_map.get(&flag_key).unwrap();
+            match result {
+                Ok(flag_match) => {
+                    self.flag_evaluation_state
+                        .add_flag_evaluation_result(flag.id, flag_match.get_flag_value());
+                    flag_details_map.insert(flag_key, FlagDetails::create(flag, &flag_match));
+                }
+                Err(e) => {
+                    errors_while_computing_flags = true;
+                    let reason = parse_exception_for_prometheus_label(&e);
 
-                match result {
-                    Ok(flag_match) => {
-                        flag_details_map.insert(flag_key, FlagDetails::create(flag, &flag_match));
-                    }
-                    Err(e) => {
-                        errors_while_computing_flags = true;
-                        // TODO add posthog error tracking
+                    // Only log errors that aren't CohortNotFound, since CohortNotFound errors bubble up here in the event
+                    // that the flag is targeting a deleted cohort
+                    if !matches!(e, FlagError::CohortNotFound(_)) {
                         error!(
                             "Error evaluating feature flag '{}' for distinct_id '{}': {:?}",
                             flag_key, self.distinct_id, e
                         );
-                        let reason = parse_exception_for_prometheus_label(&e);
-                        inc(
-                            FLAG_EVALUATION_ERROR_COUNTER,
-                            &[("reason".to_string(), reason.to_string())],
-                            1,
+                    } else {
+                        warn!(
+                            "Feature flag '{}' targeting deleted cohort for distinct_id '{}': {:?}",
+                            flag_key, self.distinct_id, e
                         );
-                        flag_details_map.insert(flag_key, FlagDetails::create_error(flag, reason));
                     }
+
+                    inc(
+                        FLAG_EVALUATION_ERROR_COUNTER,
+                        &[("reason".to_string(), reason.to_string())],
+                        1,
+                    );
+                    flag_details_map.insert(flag_key, FlagDetails::create_error(flag, reason));
                 }
             }
-            flag_get_match_timer
-                .label(
-                    "outcome",
-                    if errors_while_computing_flags {
-                        "error"
-                    } else {
-                        "success"
-                    },
-                )
-                .fin();
         }
+        flag_get_match_timer
+            .label(
+                "outcome",
+                if errors_while_computing_flags {
+                    "error"
+                } else {
+                    "success"
+                },
+            )
+            .fin();
 
         FlagsResponse {
             errors_while_computing_flags,
@@ -897,9 +942,25 @@ impl FeatureFlagMatcher {
                 return self.check_rollout(feature_flag, rollout_percentage, hash_key_overrides);
             }
 
+            // Separate flag value filters from other filters
+            let (flag_value_filters, other_filters): (Vec<PropertyFilter>, Vec<PropertyFilter>) =
+                flag_property_filters
+                    .iter()
+                    .cloned()
+                    .partition(|prop| prop.is_feature_flag());
+
+            if !flag_value_filters.is_empty()
+                && !all_flag_condition_properties_match(
+                    &flag_value_filters,
+                    &self.flag_evaluation_state.flag_evaluation_results,
+                )
+            {
+                return Ok((false, FeatureFlagMatchReason::NoConditionMatch));
+            }
+
             // Separate cohort and non-cohort filters
             let (cohort_filters, non_cohort_filters): (Vec<PropertyFilter>, Vec<PropertyFilter>) =
-                flag_property_filters
+                other_filters
                     .iter()
                     .cloned()
                     .partition(|prop| prop.is_cohort());
@@ -1262,7 +1323,10 @@ impl FeatureFlagMatcher {
                 Ok(())
             }
             Err(e) => {
-                error!("Error fetching properties: {:?}", e);
+                error!(
+                    "Error fetching properties for team {} project {} distinct_id {}: {:?}",
+                    self.team_id, self.project_id, self.distinct_id, e
+                );
                 db_fetch_timer.label("outcome", "error").fin();
                 Err(e)
             }
@@ -1379,7 +1443,7 @@ mod tests {
             flag_group_type_mapping::GroupTypeMappingCache,
             flag_models::{FlagFilters, MultivariateFlagOptions, MultivariateFlagVariant},
         },
-        properties::property_models::OperatorType,
+        properties::property_models::{OperatorType, PropertyType},
         utils::test_utils::{
             add_person_to_cohort, create_test_flag, get_person_id_by_distinct_id,
             insert_cohort_for_team_in_pg, insert_new_team_in_pg, insert_person_for_team_in_pg,
@@ -1519,7 +1583,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("override@example.com")),
                         operator: None,
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -1581,7 +1645,7 @@ mod tests {
                         key: "industry".to_string(),
                         value: Some(json!("tech")),
                         operator: None,
-                        prop_type: "group".to_string(),
+                        prop_type: PropertyType::Group,
                         group_type_index: Some(1),
                         negation: None,
                     }]),
@@ -1751,6 +1815,66 @@ mod tests {
         assert_eq!(reason, FeatureFlagMatchReason::ConditionMatch);
     }
 
+    #[tokio::test]
+    async fn test_is_condition_match_flag_value_operator() {
+        let reader = setup_pg_reader_client(None).await;
+        let writer = setup_pg_writer_client(None).await;
+        let cohort_cache = Arc::new(CohortCacheManager::new(reader.clone(), None, None));
+        let flag = create_test_flag(
+            Some(2),
+            None,
+            None,
+            None,
+            Some(FlagFilters {
+                groups: vec![FlagPropertyGroup {
+                    properties: Some(vec![]),
+                    rollout_percentage: Some(100.0),
+                    variant: None,
+                }],
+                multivariate: None,
+                aggregation_group_type_index: None,
+                payloads: None,
+                super_groups: None,
+                holdout_groups: None,
+            }),
+            None,
+            None,
+            None,
+        );
+
+        let condition = FlagPropertyGroup {
+            variant: None,
+            properties: Some(vec![PropertyFilter {
+                key: "1".to_string(),
+                value: Some(json!(true)),
+                operator: Some(OperatorType::Exact),
+                prop_type: PropertyType::Flag,
+                group_type_index: None,
+                negation: None,
+            }]),
+            rollout_percentage: Some(100.0),
+        };
+
+        let mut matcher = FeatureFlagMatcher::new(
+            "test_user".to_string(),
+            1,
+            1,
+            reader,
+            writer,
+            cohort_cache,
+            None,
+            None,
+        );
+        matcher
+            .flag_evaluation_state
+            .add_flag_evaluation_result(1, FlagValue::Boolean(true));
+        let (is_match, reason) = matcher
+            .is_condition_match(&flag, &condition, None, None)
+            .unwrap();
+        assert!(is_match);
+        assert_eq!(reason, FeatureFlagMatchReason::ConditionMatch);
+    }
+
     fn create_test_flag_with_variants(team_id: TeamId) -> FeatureFlag {
         FeatureFlag {
             id: 1,
@@ -1812,7 +1936,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("test@example.com")),
                         operator: Some(OperatorType::Exact),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -1945,7 +2069,7 @@ mod tests {
                             key: "age".to_string(),
                             value: Some(json!(25)),
                             operator: Some(OperatorType::Gte),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         },
@@ -1953,7 +2077,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("example@domain.com")),
                             operator: Some(OperatorType::Icontains),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         },
@@ -2181,7 +2305,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("test@example.com")),
                         operator: None,
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -2243,7 +2367,7 @@ mod tests {
                         key: "age".to_string(),
                         value: Some(json!(25)),
                         operator: Some(OperatorType::Gte),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -2343,7 +2467,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("user1@example.com")),
                             operator: None,
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -2355,7 +2479,7 @@ mod tests {
                             key: "age".to_string(),
                             value: Some(json!(30)),
                             operator: Some(OperatorType::Gte),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -2586,7 +2710,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort_row.id)),
                         operator: Some(OperatorType::In),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -2659,7 +2783,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("fake@posthog.com")),
                             operator: Some(OperatorType::Exact),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -2671,7 +2795,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("test@posthog.com")),
                             operator: Some(OperatorType::Exact),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -2692,7 +2816,7 @@ mod tests {
                         key: "is_enabled".to_string(),
                         value: Some(json!(["true"])),
                         operator: Some(OperatorType::Exact),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -2811,7 +2935,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("fake@posthog.com")),
                             operator: Some(OperatorType::Exact),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -2823,7 +2947,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("test@posthog.com")),
                             operator: Some(OperatorType::Exact),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -2844,7 +2968,7 @@ mod tests {
                         key: "is_enabled".to_string(),
                         value: Some(json!("true")),
                         operator: Some(OperatorType::Exact),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -2917,7 +3041,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("fake@posthog.com")),
                             operator: Some(OperatorType::Exact),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -2929,7 +3053,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("test@posthog.com")),
                             operator: Some(OperatorType::Exact),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -2950,7 +3074,7 @@ mod tests {
                         key: "is_enabled".to_string(),
                         value: Some(json!(false)),
                         operator: Some(OperatorType::Exact),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -3092,7 +3216,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort_row.id)),
                         operator: Some(OperatorType::In),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3185,7 +3309,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort_row.id)),
                         operator: Some(OperatorType::NotIn),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3278,7 +3402,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort_row.id)),
                         operator: Some(OperatorType::NotIn),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3392,7 +3516,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(dependent_cohort_row.id)),
                         operator: Some(OperatorType::In),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3485,7 +3609,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort_row.id)),
                         operator: Some(OperatorType::In),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3571,7 +3695,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort.id)),
                         operator: Some(OperatorType::In),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3656,7 +3780,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort.id)),
                         operator: Some(OperatorType::In),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3736,7 +3860,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort.id)),
                         operator: Some(OperatorType::NotIn),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3829,7 +3953,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort.id)),
                         operator: Some(OperatorType::NotIn),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -3899,7 +4023,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("user3@example.com")),
                         operator: None,
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -3995,7 +4119,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("user4@example.com")),
                         operator: None,
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4076,7 +4200,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("user5@example.com")),
                         operator: None,
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4106,7 +4230,7 @@ mod tests {
                         key: "age".to_string(),
                         value: Some(json!(30)),
                         operator: Some(OperatorType::Gt),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4205,7 +4329,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("test@example.com")),
                         operator: None,
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4276,7 +4400,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("test@example.com")),
                         operator: None,
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4380,7 +4504,7 @@ mod tests {
                         key: "$some_prop".to_string(),
                         value: Some(json!(4)),
                         operator: Some(OperatorType::Gt),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4413,7 +4537,7 @@ mod tests {
                         key: "$some_prop".to_string(),
                         value: Some(json!(4)),
                         operator: Some(OperatorType::Gt),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4446,7 +4570,7 @@ mod tests {
                         key: "$some_prop".to_string(),
                         value: Some(json!(4)),
                         operator: Some(OperatorType::Gt),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4717,7 +4841,7 @@ mod tests {
                         key: "id".to_string(),
                         value: Some(json!(cohort.id)),
                         operator: Some(OperatorType::In),
-                        prop_type: "cohort".to_string(),
+                        prop_type: PropertyType::Cohort,
                         group_type_index: None,
                         negation: Some(false),
                     }]),
@@ -4777,7 +4901,7 @@ mod tests {
                         key: "email".to_string(),
                         value: Some(json!("test@example.com")),
                         operator: Some(OperatorType::Exact),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
@@ -4846,7 +4970,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("@storytell.ai")),
                             operator: Some(OperatorType::Icontains),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -4863,7 +4987,7 @@ mod tests {
                                 "matt.amick@purplewave.com"
                             ])),
                             operator: Some(OperatorType::Exact),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -4875,7 +4999,7 @@ mod tests {
                             key: "email".to_string(),
                             value: Some(json!("@posthog.com")),
                             operator: Some(OperatorType::Icontains),
-                            prop_type: "person".to_string(),
+                            prop_type: PropertyType::Person,
                             group_type_index: None,
                             negation: None,
                         }]),
@@ -4891,7 +5015,7 @@ mod tests {
                         key: "$feature_enrollment/artificial-hog".to_string(),
                         value: Some(json!(["true"])),
                         operator: Some(OperatorType::Exact),
-                        prop_type: "person".to_string(),
+                        prop_type: PropertyType::Person,
                         group_type_index: None,
                         negation: None,
                     }]),
