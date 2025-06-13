@@ -5,6 +5,7 @@ from langchain_core.runnables import RunnableLambda
 from ee.hogai.graph.funnels.nodes import FunnelGeneratorNode, FunnelsSchemaGeneratorOutput
 from ee.hogai.utils.types import AssistantState, PartialAssistantState
 from posthog.schema import (
+    AssistantFunnelsFilter,
     AssistantFunnelsQuery,
     HumanMessage,
     VisualizationMessage,
@@ -39,3 +40,8 @@ class TestFunnelsGeneratorNode(BaseTest):
                     plan="",
                 ),
             )
+
+    def test_schema_does_not_require_aggregation_by_hogql(self):
+        """Catches the regression where the schema set funnelAggregateByHogQL."""
+        schema = AssistantFunnelsQuery(series=[], funnelsFilter=AssistantFunnelsFilter())
+        self.assertIsNone(schema.funnelsFilter.funnelAggregateByHogQL)
