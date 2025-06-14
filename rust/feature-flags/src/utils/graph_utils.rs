@@ -168,18 +168,29 @@ where
 
     /// Computes evaluation stages where each stage contains nodes that can be safely evaluated in parallel.
     ///
-    /// Nodes in earlier stages have no dependents or all dependents already evaluated.
     /// This is a "leaves-first" topological batching algorithm, ideal for feature flag evaluation.
     ///
-    /// Returns a vector of stages, where each stage is a vector of references to items that can be
-    /// evaluated in parallel. Items in earlier stages must be evaluated before items in later stages.
+    /// Each stage consists of all nodes whose dependencies have already been evaluated.
+    /// Items in earlier stages must be evaluated before items in later stages.
+    ///
+    /// Graph edge semantics reminder:
+    /// - Edges point from dependent → dependency:
+    ///     A → B means "A depends on B" (A requires B to be evaluated first)
+    /// - Therefore:
+    ///     - Outgoing edges = dependencies
+    ///     - Incoming edges = dependents (nodes that require this node)
+    ///
+    /// The algorithm works by repeatedly finding all nodes that have no remaining dependencies (out-degree == 0),
+    /// evaluating them as one stage, and then decrementing the remaining dependencies of their dependents.
     pub fn evaluation_stages(&self) -> Result<Vec<Vec<&T>>, T::Error> {
         use petgraph::Direction::{Incoming, Outgoing};
 
+        // how many dependencies each node has remaining
         let mut out_degree = HashMap::new();
+        // maps NodeIndex → &T for easy lookup later
         let mut node_map = HashMap::new();
 
-        // Initialize out-degree counts and node map
+        // Initialize the out-degree and node_map
         for node_idx in self.graph.node_indices() {
             let node = &self.graph[node_idx];
             node_map.insert(node_idx, node);
@@ -189,10 +200,13 @@ where
 
         let mut stages = Vec::new();
 
+        // We'll add nodes to stages as we find them.
+        // We'll remove nodes from the out_degree map as we process them.
+        // We'll stop when the out_degree map is empty.
         while !out_degree.is_empty() {
             let mut current_stage = Vec::new();
 
-            // Collect all nodes with no dependents (out-degree 0)
+            // Find all nodes whose dependencies have been fully satisfied (out-degree == 0)
             for (&node_idx, &deg) in out_degree.iter() {
                 if deg == 0 {
                     current_stage.push(node_idx);
@@ -200,15 +214,15 @@ where
             }
 
             if current_stage.is_empty() {
-                // This should never happen if the graph is acyclic (already validated during build)
+                // This indicates a cycle — should not occur if graph is properly validated during build (which we do!)
                 return Err(FlagError::DependencyCycle(T::dependency_type(), 0).into());
             }
 
-            // Map to item references for output
+            // Collect references to items in this stage
             let stage_items: Vec<&T> = current_stage.iter().map(|idx| node_map[idx]).collect();
             stages.push(stage_items);
 
-            // Remove processed nodes, update parents' out-degrees
+            // After processing current stage, decrement out-degree (dependency count) of parents (dependents)
             for node_idx in &current_stage {
                 for parent in self.graph.neighbors_directed(*node_idx, Incoming) {
                     if let Some(deg) = out_degree.get_mut(&parent) {
