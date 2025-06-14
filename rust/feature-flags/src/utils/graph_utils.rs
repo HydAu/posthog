@@ -166,6 +166,62 @@ where
         Ok(results)
     }
 
+    /// Computes evaluation stages where each stage contains nodes that can be safely evaluated in parallel.
+    ///
+    /// Nodes in earlier stages have no dependents or all dependents already evaluated.
+    /// This is a "leaves-first" topological batching algorithm, ideal for feature flag evaluation.
+    ///
+    /// Returns a vector of stages, where each stage is a vector of references to items that can be
+    /// evaluated in parallel. Items in earlier stages must be evaluated before items in later stages.
+    pub fn evaluation_stages(&self) -> Result<Vec<Vec<&T>>, T::Error> {
+        use petgraph::Direction::{Incoming, Outgoing};
+
+        let mut out_degree = HashMap::new();
+        let mut node_map = HashMap::new();
+
+        // Initialize out-degree counts and node map
+        for node_idx in self.graph.node_indices() {
+            let node = &self.graph[node_idx];
+            node_map.insert(node_idx, node);
+            let deg = self.graph.edges_directed(node_idx, Outgoing).count();
+            out_degree.insert(node_idx, deg);
+        }
+
+        let mut stages = Vec::new();
+
+        while !out_degree.is_empty() {
+            let mut current_stage = Vec::new();
+
+            // Collect all nodes with no dependents (out-degree 0)
+            for (&node_idx, &deg) in out_degree.iter() {
+                if deg == 0 {
+                    current_stage.push(node_idx);
+                }
+            }
+
+            if current_stage.is_empty() {
+                // This should never happen if the graph is acyclic (already validated during build)
+                return Err(FlagError::DependencyCycle(T::dependency_type(), 0).into());
+            }
+
+            // Map to item references for output
+            let stage_items: Vec<&T> = current_stage.iter().map(|idx| node_map[idx]).collect();
+            stages.push(stage_items);
+
+            // Remove processed nodes, update parents' out-degrees
+            for node_idx in &current_stage {
+                for parent in self.graph.neighbors_directed(*node_idx, Incoming) {
+                    if let Some(deg) = out_degree.get_mut(&parent) {
+                        *deg -= 1;
+                    }
+                }
+                out_degree.remove(node_idx);
+            }
+        }
+
+        Ok(stages)
+    }
+
     /// Helper to get a node's ID as an i64
     fn get_node_id(&self, index: petgraph::graph::NodeIndex) -> i64 {
         self.graph[index].get_id().into()
